@@ -7,6 +7,7 @@ require github.com/open-feature/go-sdk v1.18.0
 require github.com/tetratelabs/wazero v1.9.0
 
 require (
+	github.com/nicklasl/wasmtime-go/v50 v50.0.1
 	github.com/prometheus/common v0.67.5
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.79.3
