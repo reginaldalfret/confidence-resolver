@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"testing"
 
@@ -19,23 +18,20 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// repoRoot is the confidence-resolver checkout root, resolved relative to
-// this file so tests work from any working directory.
-var repoRoot = func() string {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		panic("failed to resolve test repo root via runtime.Caller")
-	}
-	// module_fixtures.go lives at:
-	// openfeature-provider/go/confidence/internal/testutil/module_fixtures.go
-	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "..")
-}()
-
 // LoadClientModuleFixture reads a compiled client module from the
 // confidence package's testdata directory.
+//
+// The path is resolved relative to the working directory of the calling
+// test (go test runs each package's tests with the package directory as
+// the working directory), which keeps it correct both in a checkout and
+// in Docker build stages where the source tree layout differs.
 func LoadClientModuleFixture(t *testing.T, name string) []byte {
 	t.Helper()
-	dataPath := filepath.Join(repoRoot, "confidence", "testdata", name)
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Skipf("Skipping test - could not resolve working directory: %v", err)
+	}
+	dataPath := filepath.Join(wd, "testdata", name)
 	data, err := os.ReadFile(dataPath)
 	if err != nil {
 		t.Skipf("Skipping test - could not load module fixture %s: %v", name, err)
