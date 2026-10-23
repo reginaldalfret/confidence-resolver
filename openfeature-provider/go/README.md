@@ -6,12 +6,44 @@ A high-performance OpenFeature provider for [Confidence](https://confidence.spot
 
 ## Features
 
-- **Local Resolution**: Evaluates feature flags locally using WebAssembly (WASM)
+- **Compiled Client Module**: Hosts a WASM module that already contains your credential's flag rules, fetched as an encrypted artifact from the Confidence module CDN
 - **Low Latency**: No network calls during flag evaluation
-- **Automatic Sync**: Periodically syncs flag configurations from Confidence
-- **Exposure Logging**: Fully supported exposure logging and resolve analytics
+- **Automatic Refresh**: Polls for recompiled modules; a published change becomes visible within about a minute
+- **Exposure Logging**: Fully supported exposure logging and resolve analytics, delivered to the Confidence ingestion API
 - **[Event Tracking](#event-tracking)**: Send custom events via the OpenFeature `Track()` API
 - **OpenFeature Compatible**: Works with the standard OpenFeature Go SDK
+
+## How It Works
+
+Previous versions of this provider downloaded encrypted flag *state* and
+loaded it into a generic embedded resolver at startup. This provider hosts a
+**compiled client module** instead: a WebAssembly module compiled ahead of
+time from your account's flag rules, filtered down to the single credential,
+and published as a small encrypted artifact per credential.
+
+- The provider fetches `modules/<sha256(client-secret)>.wasm.enc` from the
+  module CDN, decrypts it with the credential's AES-256-GCM key, parses a
+  small wrapper (module bytes + a compiler-signed log token), and verifies
+  the module's embedded metadata (schema version, credential hash) before
+  instantiating it.
+- Loading a module *is* loading its flags: there is no state to install and
+  no protobuf state to parse at runtime.
+- The module runs on [wasmtime](https://wasmtime.dev/) (via its Go bindings)
+  with the WebAssembly threads proposal: one shared memory holds the flag
+  data, initialized once, and all evaluation entry is serialized through one
+  instance.
+- Evaluation itself (splitting `my-flag.path.to.field` into flag and value
+  path, walking the path, checking the resolved value against your default,
+  merging defaults into nulls, and mapping errors) is performed by the
+  module's `evaluate` export, so every OpenFeature provider in this
+  repository applies identical evaluation semantics.
+- The module pushes log batches (exposure/assignment events and resolve
+  analytics) to the provider, which forwards them unchanged to the
+  Confidence ingestion API with the wrapper's log token. Delivery is
+  strictly best-effort: it never blocks or fails an evaluation.
+
+No account identifier is configured: it is not present in the artifact path,
+not present in the module, and not needed to send logs.
 
 ## Installation
 
@@ -24,8 +56,8 @@ go mod tidy
 
 - Go 1.25+
 - OpenFeature Go SDK 1.16.0+
-
-> **Note:** Use v0.20.1 or later; the v0.20.0 tag shipped with an out-of-sync embedded WASM module.
+- A platform supported by the wasmtime Go bindings' prebuilt libraries
+  (linux/amd64, linux/arm64, macOS/amd64, macOS/arm64, windows/amd64)
 
 ## Getting Your Credentials
 
@@ -40,9 +72,7 @@ You'll need a **client secret** from Confidence to use this provider.
 
 ## Encryption
 
-The provider fetches encrypted flag state and decrypts it when loading the resolver. Pass the encryption key for your client credential when creating the provider.
-
-See the [Integration Guide](../INTEGRATION_GUIDE.md#encryption) for background and migration details.
+The provider fetches the credential's encrypted module artifact and decrypts it when loading the module. Pass the encryption key for your client credential when creating the provider. The wrapper uses the same wire format (`12-byte nonce || ciphertext || 16-byte tag`, empty associated data) and the same per-credential key as encrypted resolver state.
 
 Pass the encryption key in `ProviderConfig`:
 
@@ -121,11 +151,11 @@ evalCtx := openfeature.NewEvaluationContext("user-123", map[string]interface{}{
 
 The provider uses a **default value fallback** pattern - when evaluation fails, it returns your specified default value instead of throwing an error.
 
-Initialization uses one total 30-second budget by default, including state requests and one-second retry delays. `SetProviderAndWait` returns `nil` as soon as valid state is installed. If the budget expires, it returns a recoverable timeout error; evaluations use caller-supplied defaults while the provider keeps retrying in the background. Successful background recovery emits `PROVIDER_READY` and resumes the configured state polling interval.
+Initialization uses one total 30-second budget by default, including module fetches and one-second retry delays. `SetProviderAndWait` returns `nil` as soon as a module is loaded. If the budget expires, it returns a recoverable timeout error; evaluations use caller-supplied defaults (`PROVIDER_NOT_READY`) while the provider keeps retrying in the background. Successful background recovery emits `PROVIDER_READY`.
 
-Network failures, timeouts, HTTP 408/429/5xx, and HTTP 404 are retried; 404 remains retryable to allow state provisioning. Other HTTP 4xx responses (including 401/403), decryption/decoding failures, missing account IDs, and rejected resolver state stop startup retries and report `FATAL` with the cause. Correct the configuration or payload and register a new provider to recover from a fatal startup error.
+A `404` from the module CDN primarily means "no module published for this credential yet" — for example before the credential's state has been compiled — and is retried like any other transient failure, as are network errors, timeouts and 5xx responses. Decrypt failures (the expected symptom of an encryption-key rotation not yet picked up) keep the last good module and retry on the next poll.
 
-Once valid state has been installed, **any** refresh failure preserves the last working state. The provider remains `READY`, evaluations continue using cached flags, and polling continues. Rejected state, including subsequent 304 responses for those rejected bytes, never replaces the last working state.
+Once a module is loaded, **any** refresh failure preserves the last working module: the provider stays `READY`, evaluations keep using the loaded rules, and polling continues. A replacement that fails validation (unknown metadata schema version, a credential hash mismatch, unparsable bytes) never replaces the last working module. A wrapper whose module bytes are unchanged — only the log token differs — takes effect without re-instantiating anything.
 
 **📖 See the [Integration Guide: Error Handling](../INTEGRATION_GUIDE.md#error-handling)** for:
 
@@ -172,13 +202,6 @@ Configure the provider behavior using environment variables:
 - `CONFIDENCE_MATERIALIZATION_READ_TIMEOUT_SECONDS`: Timeout for remote materialization store read operations (default: `2` seconds)
 - `CONFIDENCE_MATERIALIZATION_WRITE_TIMEOUT_SECONDS`: Timeout for remote materialization store write operations (default: `5` seconds)
 
-#### Deprecated Environment Variables
-
-The following environment variables are deprecated and will be removed in a future version. Use `ProviderConfig` fields instead:
-
-- `CONFIDENCE_STATE_POLL_INTERVAL_SECONDS`: Use `ProviderConfig.StatePollInterval` instead
-- `CONFIDENCE_LOG_POLL_INTERVAL_SECONDS`: Use `ProviderConfig.LogPollInterval` instead
-
 ### ProviderConfig
 
 The `ProviderConfig` struct contains all configuration options for the provider:
@@ -192,11 +215,12 @@ The `ProviderConfig` struct contains all configuration options for the provider:
 
 - `Logger` (\*slog.Logger): Custom logger for provider operations. If not provided, a default text logger is created. See [Logging](#logging) for details.
 - `TransportHooks` (TransportHooks): Custom transport hooks for advanced use cases (e.g., custom gRPC interceptors, HTTP transport wrapping, TLS configuration). The default gRPC dial options include a retry policy for flag log writes (3 attempts with exponential backoff on `UNAVAILABLE`). Custom `TransportHooks` receive these options in `ModifyGRPCDial` and can keep, modify, or replace them. See [gRPC retry via service config](https://grpc.io/docs/guides/retry/) for details.
-- `StatePollInterval` (time.Duration): Interval for polling flag state updates (default: 10 seconds)
-- `LogPollInterval` (time.Duration): Interval for flushing evaluation logs (default: 60 seconds)
+- `ModulePollInterval` (time.Duration): Interval for polling fresh module artifacts (default: 30 seconds). The CDN caches briefly, so a published change becomes visible within about a minute.
+- `LogFlushInterval` (time.Duration): Interval for flushing evaluation logs out of the module so low-volume credentials stay observable (default: 5 seconds)
 - `InitializationTimeout` (time.Duration): Total startup retry budget before initialization returns a recoverable timeout error (default: 30 seconds)
-- `ResolverPoolSize` (int): Number of WASM resolver instances in the pool (default: `2`). Increase for higher concurrency (with the penalty of higher memory footprint).
-- `UseWasmInterpreter` (bool): Run the embedded WASM resolver in wazero **interpreter** mode instead of the default **JIT compiler** (default: `false`). See [WASM interpreter mode](#wasm-interpreter-mode) for when to enable this and the performance trade-offs.
+- `ModuleBaseURL` (string): Module CDN base URL override (default: the production host). Intended for testing.
+- `IngestionBaseURL` (string): Flag-log ingestion API base URL override (default: the regionless `https://ingestion.confidence.dev`; the regional eu/us hosts can be set explicitly). Intended for testing.
+- `UseWasmInterpreter` (bool): Run the (optional) event engine in wazero **interpreter** mode instead of the default **JIT compiler** (default: `false`). The flag resolver itself always runs on wasmtime. See [WASM interpreter mode](#wasm-interpreter-mode).
 - `MaterializationStore` (MaterializationStore): Storage for sticky variant assignments and materialized segments. Options include:
 
   - `nil` (default): Falls back to default values for flags requiring materializations
@@ -205,18 +229,21 @@ The `ProviderConfig` struct contains all configuration options for the provider:
 
   See [Materialization Stores](#materialization-stores) for details.
 
-#### Testing encrypted state
+#### Testing the module flow
 
-Use `NewProvider` with a test `EncryptionKey` and `TransportHooks` that route CDN
-requests to a test server serving encrypted fixtures. Keyless construction helpers
-(`NewLocalResolverProvider` and `NewProviderForTest`) are now internal.
+Integration tests host checked-in module fixtures compiled by the
+state-to-wasm compiler (see `confidence/testdata/`), wrap them on the fly in
+the encrypted artifact format with a freshly generated AES-256 key, and serve
+them from a mock CDN so the full init flow (fetch → decrypt → wrapper parse →
+metadata validation → instantiate → resolve) runs against real module bytes.
 
 ## Apply-event deduplication
 
-Apply-event deduplication is **on by default**. The WASM resolver collapses
-byte-identical apply events for the same unit and variant within a 120-second
-TTL window (tracking up to 100,000 entries), so repeatedly resolving the same
-flag for the same targeting key produces one apply event instead of many.
+Apply-event deduplication is **on by default**. The provider answers the
+module's apply-filter callback with a host-side seen-set that collapses
+repeated assignments for the same fingerprint within a 10-minute TTL window
+(bounded at 65,536 entries), so repeatedly resolving the same flag for the
+same targeting key produces one apply event instead of many.
 
 Upgrading without changing any code therefore reduces raw apply-event volume,
 substantially so for high-QPS traffic that resolves the same flag for the same
@@ -239,9 +266,7 @@ it, so `false` does **not** disable dedup — use `DisableApplyDedup`.
 
 ## WASM interpreter mode
 
-By default the Go provider runs the embedded resolver through [wazero](https://wazero.io/)'s **JIT compiler** (Wazevo), which compiles WASM to native code for low-latency flag evaluation. On **linux/arm64**, CPU profiling (`SIGPROF`) or goroutine preemption (`SIGURG`) can arrive while a thread is executing that JIT code. Go cannot attribute the signal to a goroutine in that state and may exit the process silently (exit code 139, no stack trace).
-
-Setting `UseWasmInterpreter: true` switches wazero to its **interpreter** engine. WASM runs as ordinary Go code on a normal goroutine stack, so profiling and preemption signals are handled safely. This is an **opt-in safety valve** — keep the default unless you need it.
+`UseWasmInterpreter` applies to the optional [event engine](#event-tracking), which runs on [wazero](https://wazero.io/)'s JIT compiler by default. On **linux/arm64**, CPU profiling (`SIGPROF`) or goroutine preemption (`SIGURG`) can arrive while a thread is executing that JIT code; Go cannot attribute the signal to a goroutine in that state and may exit the process silently. Setting `UseWasmInterpreter: true` switches the event engine to wazero's interpreter, which runs as ordinary Go code on a normal goroutine stack. The flag resolver itself is unaffected: it runs on wasmtime regardless of this setting.
 
 ### When to enable interpreter mode
 
@@ -581,10 +606,10 @@ The provider logs at different levels: `Debug` (flag resolution details), `Info`
 
 ### What Happens During Shutdown?
 
-1. **Flushes pending logs** to Confidence (exposure events, resolve analytics)
-2. **Closes gRPC connections** and releases network resources
-3. **Stops background tasks** (state polling, log batching)
-4. **Releases WASM instance** and memory
+1. **Drains the event tracker** and closes the events gRPC channel
+2. **Flushes pending log batches** out of the module and waits (bounded) for the ingestion queue to drain
+3. **Retires the module instance** (`destroy_instance`) and releases the shared memory
+4. **Stops background tasks** (module polling, log flushing)
 
 The shutdown respects the context timeout you provide.
 
@@ -659,18 +684,23 @@ This is an advanced feature intended for exceptional cases. If you're considerin
 
 See the root `LICENSE` file.
 
-### Migrating to mandatory encryption
+### Migrating from the state-based provider
 
-`EncryptionKey` is now required when constructing the provider. Supply exactly 64
-hexadecimal characters. Missing, empty, or malformed keys fail before network
-activity. The provider only fetches encrypted state and never falls back to plaintext.
+The provider no longer downloads flag state or embeds a generic resolver WASM;
+it hosts the credential's **compiled client module** fetched from the module
+CDN. What changes for you:
 
-Open [Confidence Admin → Clients](https://app.confidence.spotify.com/admin/clients),
-select your client, and locate the credential used by the provider. Each credential
-has its own unique encryption key, available alongside it. Use the key paired with
-your configured client secret. Configure and verify encryption on your existing
-SDK before upgrading.
-
-`NewFlagsAdminStateFetcher` and `NewFlagsAdminStateFetcherWithTransport` now take
-an encryption key after the client secret. All state-fetcher constructors return
-`(*FlagsAdminStateFetcher, error)`; handle configuration errors before using them.
+- `EncryptionKey` is still required (it now decrypts the module wrapper) and
+  `ClientSecret` is unchanged; the same admin-view credentials work.
+- `StatePollInterval` is replaced by `ModulePollInterval` (default 30 seconds)
+  and `LogPollInterval` by `LogFlushInterval` (default 5 seconds).
+- `ResolverPoolSize` is gone: the module keeps its flag data in one shared
+  memory and all evaluation entry is serialized through one instance.
+- `EnableApplyDedup` / `WithEventTracking`-style functional options are gone;
+  everything is configured through `ProviderConfig`. Event tracking remains
+  enabled by default via the embedded event engine.
+- Flag logs are delivered to the Confidence ingestion API using the
+  compiler-signed log token that ships inside the module wrapper, instead of
+  the previous per-account log destinations.
+- The provider now depends on the wasmtime Go bindings (cgo). If you build
+  for a platform outside linux/macOS/windows on amd64/arm64, file an issue.
